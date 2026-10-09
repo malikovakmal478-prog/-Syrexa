@@ -769,6 +769,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_decide, pattern="^[to]:"))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_msg))
     log.info("Syrexa ishga tushdi. Admins: %s", all_admins())
+    asyncio.set_event_loop(asyncio.new_event_loop())
     app.run_polling(drop_pending_updates=True)
 
 # ============================ MINI APP (frontend) ============================
