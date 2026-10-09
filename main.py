@@ -13,7 +13,7 @@ requirements.txt:
   requests==2.32.3
 Start command:  python main.py
 """
-import os, re, json, time, hmac, html, random, sqlite3, hashlib, asyncio, logging, threading, functools, urllib.parse
+import os, re, json, base64, time, hmac, html, random, sqlite3, hashlib, asyncio, logging, threading, functools, urllib.parse
 from datetime import datetime
 import requests
 from flask import Flask, request, jsonify, Response
@@ -51,6 +51,7 @@ create table if not exists promos(code text primary key,amount integer,left inte
 create table if not exists promo_uses(code text,uid integer,primary key(code,uid));
 create table if not exists channels(id integer primary key autoincrement,chat_id text,title text,link text);
 create table if not exists admins(id integer primary key);
+create table if not exists files(id integer primary key autoincrement,mime text,data blob);
 """
 DEFAULTS = {
     "bot_name": "Syrexa",
@@ -143,6 +144,7 @@ def ulink(u):
 
 # ============================ WEB API ============================
 web = Flask(__name__)
+web.config['MAX_CONTENT_LENGTH'] = 14 * 1024 * 1024
 
 def auth():
     init = request.headers.get("X-Init", "")
@@ -182,6 +184,10 @@ _imgdir = "/tmp/syrexa_img"; os.makedirs(_imgdir, exist_ok=True)
 @web.route("/img/<fid>")
 def img(fid):
     if not re.fullmatch(r"[A-Za-z0-9_\-]+", fid): return "", 404
+    if re.fullmatch(r"f\d+", fid):
+        r = q1("select mime,data from files where id=?", (int(fid[1:]),))
+        if not r: return "", 404
+        return Response(r["data"], mimetype=r["mime"], headers={"Cache-Control": "public, max-age=604800, immutable"})
     p = os.path.join(_imgdir, fid)
     if not os.path.exists(p):
         r = tg("getFile", file_id=fid)
@@ -293,6 +299,293 @@ def api_lang(u):
     if l in ("uz", "ru"): ex("update users set lang=? where id=?", (l, u["id"]))
     return jsonify(ok=True)
 
+# ============================ ADMIN WEB API (Mini App ichidagi panel) ============================
+def _i(v):
+    try: return int(float(str(v).replace(" ", "") or 0))
+    except Exception: return 0
+
+def need_admin(f):
+    @functools.wraps(f)
+    def w(*a, **k):
+        u = auth()
+        if not u or not is_admin(u["id"]): return jsonify(err="forbidden"), 403
+        return f(u, *a, **k)
+    return w
+
+COLS = {
+    "games": (["name", "cat", "img", "hero", "picon", "info", "field", "active", "sort"], ["active", "sort"]),
+    "products": (["game_id", "name", "price", "grp", "badge", "img", "active"], ["game_id", "price", "active"]),
+    "banners": (["img", "link"], []),
+    "cards": (["number", "holder", "bank", "active"], ["active"]),
+    "channels": (["chat_id", "title", "link"], []),
+}
+
+def decide_topup(tid, ok):
+    t = q1("select * from topups where id=?", (tid,))
+    if not t: return "Topilmadi"
+    c = ex("update topups set status=? where id=? and status in ('new','pending')", ("approved" if ok else "rejected", tid))
+    if not c.rowcount: return "Allaqachon ko'rilgan"
+    if ok:
+        ex("update users set balance=balance+? where id=?", (t["amount"], t["uid"]))
+        notify(t["uid"], f"✅ Balansingiz <b>{money(t['amount'])}</b> so'mga to'ldirildi.")
+        return "✅ Tasdiqlandi"
+    notify(t["uid"], f"❌ {money(t['amount'])} so'm to'ldirish so'rovi rad etildi.")
+    return "❌ Rad etildi"
+
+def decide_order(oid, ok):
+    o = q1("select * from orders where id=?", (oid,))
+    if not o: return "Topilmadi"
+    c = ex("update orders set status=? where id=? and status='pending'", ("done" if ok else "canceled", oid))
+    if not c.rowcount: return "Allaqachon ko'rilgan"
+    if ok:
+        notify(o["uid"], f"✅ Buyurtma #{oid} bajarildi!\n🎮 {E(o['game'])} — {E(o['product'])}")
+        return "✅ Bajarildi"
+    ex("update users set balance=balance+? where id=?", (o["price"], o["uid"]))
+    notify(o["uid"], f"❌ Buyurtma #{oid} bekor qilindi, <b>{money(o['price'])}</b> so'm balansga qaytarildi.")
+    return "❌ Bekor qilindi, pul qaytarildi"
+
+@web.route("/api/a/data/<name>")
+@need_admin
+def a_data(u, name):
+    gid = request.args.get("id", type=int); s = request.args.get("q", "").strip()
+    if name == "home":
+        d0 = (int(time.time()) + 18000) // 86400 * 86400 - 18000
+        n = q1("select count(*) c, coalesce(sum(balance),0) b from users")
+        tp = q1("select coalesce(sum(amount),0) s from topups where status='approved'")["s"]
+        tt = q1("select coalesce(sum(amount),0) s from topups where status='approved' and created>=?", (d0,))["s"]
+        od = q1("select count(*) c, coalesce(sum(price),0) s from orders where status='done'")
+        return jsonify(users=n["c"], bal=n["b"], new=q1("select count(*) c from users where joined>=?", (d0,))["c"],
+                       top_sum=tp, top_today=tt, ord_cnt=od["c"], ord_sum=od["s"],
+                       p_top=q1("select count(*) c from topups where status='pending'")["c"],
+                       p_ord=q1("select count(*) c from orders where status='pending'")["c"])
+    if name == "games":
+        return jsonify(games=qa("select g.*,(select count(*) from products where game_id=g.id) pc from games g order by sort,id"))
+    if name == "game":
+        return jsonify(game=q1("select * from games where id=?", (gid,)),
+                       products=qa("select * from products where game_id=? order by id", (gid,)))
+    if name == "banners": return jsonify(items=qa("select * from banners order by id"))
+    if name == "cards": return jsonify(items=qa("select * from cards order by id"))
+    if name == "users":
+        if s.isdigit(): rows = qa("select * from users where id=? or name like ? limit 30", (int(s), f"%{s}%"))
+        elif s: rows = qa("select * from users where name like ? or username like ? limit 30", (f"%{s}%", f"%{s.lstrip('@')}%"))
+        else: rows = qa("select * from users order by id desc limit 30")
+        return jsonify(items=rows)
+    if name == "tops":
+        return jsonify(items=qa("select t.*,u.name uname from topups t left join users u on u.id=t.uid where t.status!='new' order by (t.status='pending') desc, t.id desc limit 40"))
+    if name == "ords":
+        return jsonify(items=qa("select o.*,u.name uname from orders o left join users u on u.id=o.uid order by (o.status='pending') desc, o.id desc limit 40"))
+    if name == "promos": return jsonify(items=qa("select * from promos"))
+    if name == "chs": return jsonify(items=qa("select * from channels"))
+    if name == "set": return jsonify(s={k: gs(k) for k in DEFAULTS})
+    if name == "adms": return jsonify(items=all_admins(), owners=OWNERS)
+    if name == "bc": return jsonify(users=q1("select count(*) c from users where banned=0")["c"])
+    return jsonify(err="nf"), 404
+
+@web.route("/api/a/save/<t>", methods=["POST"])
+@need_admin
+def a_save(u, t):
+    d = request.get_json(silent=True) or {}
+    if t == "promos":
+        code = str(d.get("code", "")).strip().upper()
+        if not code or _i(d.get("amount")) <= 0: return jsonify(err="Kod va summani kiriting"), 400
+        ex("insert or replace into promos(code,amount,left) values(?,?,?)", (code, _i(d.get("amount")), _i(d.get("left")))); return jsonify(ok=True)
+    if t not in COLS: return jsonify(err="bad"), 400
+    cols, ints = COLS[t]; vals = {}
+    for c in cols:
+        if c in d: vals[c] = _i(d[c]) if c in ints else str(d[c] if d[c] is not None else "").strip()
+    if t == "games" and not vals.get("name"): return jsonify(err="Nom kiriting"), 400
+    if t == "products" and (not vals.get("name") or vals.get("price", 0) <= 0): return jsonify(err="Nom va narxni kiriting"), 400
+    if t == "banners" and not vals.get("img"): return jsonify(err="Rasm tanlang"), 400
+    if t == "cards" and "number" in vals:
+        dg = re.sub(r"\D", "", vals["number"])
+        if len(dg) < 12: return jsonify(err="Karta raqami noto'g'ri"), 400
+        vals["number"] = " ".join(dg[i:i+4] for i in range(0, len(dg), 4))
+    if t == "channels" and not d.get("id"):
+        r = tg("getChat", chat_id=vals.get("chat_id", ""))
+        if not r.get("ok"): return jsonify(err="Kanal topilmadi yoki bot u yerda admin emas"), 400
+        c = r["result"]; vals["chat_id"] = str(c["id"]); vals["title"] = c.get("title", "")
+        vals["link"] = f"https://t.me/{c['username']}" if c.get("username") else (c.get("invite_link") or tg("exportChatInviteLink", chat_id=c["id"]).get("result", ""))
+    if t == "games" and not d.get("id"): vals["sort"] = q1("select coalesce(max(sort),0)+1 m from games")["m"]
+    if not vals: return jsonify(err="bo'sh"), 400
+    if d.get("id"):
+        rid = int(d["id"])
+        ex(f"update {t} set {','.join(c + '=?' for c in vals)} where id=?", (*vals.values(), rid))
+    else:
+        rid = ex(f"insert into {t}({','.join(vals)}) values({','.join('?' * len(vals))})", tuple(vals.values())).lastrowid
+    return jsonify(ok=True, id=rid)
+
+@web.route("/api/a/del/<t>", methods=["POST"])
+@need_admin
+def a_del(u, t):
+    i = (request.get_json(silent=True) or {}).get("id")
+    if t == "promos": ex("delete from promos where code=?", (str(i),))
+    elif t == "games": ex("delete from products where game_id=?", (int(i),)); ex("delete from games where id=?", (int(i),))
+    elif t in COLS: ex(f"delete from {t} where id=?", (int(i),))
+    else: return jsonify(err="bad"), 400
+    return jsonify(ok=True)
+
+@web.route("/api/a/bulk", methods=["POST"])
+@need_admin
+def a_bulk(u):
+    d = request.get_json(silent=True) or {}; n = 0
+    for line in str(d.get("text", "")).splitlines():
+        pt = [x.strip() for x in line.split("|")]
+        if len(pt) >= 2 and pt[0] and _i(pt[1]) > 0:
+            ex("insert into products(game_id,name,price,grp,badge) values(?,?,?,?,?)",
+               (int(d["game_id"]), pt[0], _i(pt[1]), pt[2] if len(pt) > 2 else "", pt[3] if len(pt) > 3 else "")); n += 1
+    if not n: return jsonify(err="Format: nom | narx | guruh | belgi"), 400
+    return jsonify(ok=True, n=n)
+
+@web.route("/api/a/upload", methods=["POST"])
+@need_admin
+def a_upload(u):
+    d = (request.get_json(silent=True) or {}).get("data", "")
+    m = re.match(r"data:(image/(?:jpeg|png|webp));base64,(.+)$", d, re.S)
+    if not m: return jsonify(err="Rasm formati noto'g'ri"), 400
+    raw = base64.b64decode(m.group(2))
+    if len(raw) > 6_000_000: return jsonify(err="Rasm juda katta"), 400
+    return jsonify(ref=f"f{ex('insert into files(mime,data) values(?,?)', (m.group(1), raw)).lastrowid}")
+
+@web.route("/api/a/import", methods=["POST"])
+@need_admin
+def a_import(u):
+    url = str((request.get_json(silent=True) or {}).get("url", "")).strip()
+    msg = "Havoladan rasm olinmadi. Rasm ustida «rasm manzilini nusxalash» qiling (.jpg/.png/.webp)"
+    if not url.startswith(("http://", "https://")): return jsonify(err=msg), 400
+    try:
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        ct = r.headers.get("content-type", "").split(";")[0].strip().lower()
+        if r.status_code != 200 or ct not in ("image/jpeg", "image/png", "image/webp") or len(r.content) > 6_000_000:
+            return jsonify(err=msg), 400
+    except Exception:
+        return jsonify(err=msg), 400
+    return jsonify(ref=f"f{ex('insert into files(mime,data) values(?,?)', (ct, r.content)).lastrowid}")
+
+@web.route("/api/a/set", methods=["POST"])
+@need_admin
+def a_set(u):
+    for k, v in (request.get_json(silent=True) or {}).items():
+        if k in DEFAULTS:
+            ss(k, re.sub(r"\D", "", str(v)) or DEFAULTS[k] if k in ("min_topup", "card_ttl") else str(v if v is not None else "").strip())
+    return jsonify(ok=True)
+
+@web.route("/api/a/user", methods=["POST"])
+@need_admin
+def a_user(u):
+    d = request.get_json(silent=True) or {}; uid = int(d["id"]); amt = _i(d.get("amt"))
+    if amt > 0:
+        ex("update users set balance=max(0,balance+?) where id=?", (amt if d.get("op") == "add" else -amt, uid))
+        notify(uid, f"{'➕' if d.get('op') == 'add' else '➖'} Balansingiz o'zgardi: <b>{money(amt)}</b> so'm")
+    if "banned" in d: ex("update users set banned=? where id=?", (1 if _i(d["banned"]) else 0, uid))
+    return jsonify(ok=True)
+
+@web.route("/api/a/topup", methods=["POST"])
+@need_admin
+def a_topup(u):
+    d = request.get_json(silent=True) or {}; return jsonify(msg=decide_topup(int(d["id"]), _i(d.get("ok"))))
+
+@web.route("/api/a/order", methods=["POST"])
+@need_admin
+def a_order(u):
+    d = request.get_json(silent=True) or {}; return jsonify(msg=decide_order(int(d["id"]), _i(d.get("ok"))))
+
+@web.route("/api/a/admin", methods=["POST"])
+@need_admin
+def a_admin(u):
+    d = request.get_json(silent=True) or {}; i = _i(d.get("id"))
+    if not i: return jsonify(err="ID kiriting"), 400
+    if d.get("remove"):
+        if i not in OWNERS: ex("delete from admins where id=?", (i,))
+    else: ex("insert or ignore into admins values(?)", (i,))
+    return jsonify(ok=True)
+
+def do_broadcast(text, img):
+    blob = None; fid = None
+    if img and re.fullmatch(r"f\d+", img):
+        r = q1("select data from files where id=?", (int(img[1:]),)); blob = r["data"] if r else None
+    elif img: fid = img
+    ok = bad = 0
+    for r0 in qa("select id from users where banned=0"):
+        uid = r0["id"]
+        try:
+            if blob and not fid:
+                r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto", data={"chat_id": uid, "caption": text, "parse_mode": "HTML"},
+                                  files={"photo": ("p.jpg", blob)}, timeout=40).json()
+                if r.get("ok"): fid = r["result"]["photo"][-1]["file_id"]
+            elif fid: r = tg("sendPhoto", chat_id=uid, photo=fid, caption=text, parse_mode="HTML")
+            else: r = tg("sendMessage", chat_id=uid, text=text, parse_mode="HTML")
+            if r.get("ok"): ok += 1
+            else: bad += 1
+        except Exception: bad += 1
+        time.sleep(0.05)
+    for a in all_admins(): notify(a, f"📨 Xabar yuborildi: ✅ {ok}  ❌ {bad}")
+
+@web.route("/api/a/broadcast", methods=["POST"])
+@need_admin
+def a_broadcast(u):
+    d = request.get_json(silent=True) or {}
+    threading.Thread(target=do_broadcast, args=(str(d.get("text", "")), str(d.get("img", ""))), daemon=True).start()
+    return jsonify(ok=True)
+
+# ============================ ZAXIRA (Render bepul rejasi bazani o'chirmasligi uchun) ============================
+_last_bak = {"id": None}
+def backup_now():
+    if not OWNERS: return
+    try:
+        tmp = "/tmp/syrexa_backup.db"
+        if os.path.exists(tmp): os.remove(tmp)
+        dst = sqlite3.connect(tmp)
+        with _lock: db.backup(dst)
+        dst.close()
+        with open(tmp, "rb") as f:
+            r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendDocument", data={"chat_id": OWNERS[0], "caption": "💾 Syrexa zaxira nusxa " + ts(time.time())},
+                              files={"document": ("syrexa_backup.db", f)}, timeout=120).json()
+        if r.get("ok"):
+            mid = r["result"]["message_id"]
+            tg("pinChatMessage", chat_id=OWNERS[0], message_id=mid, disable_notification=True)
+            if _last_bak["id"]: tg("deleteMessage", chat_id=OWNERS[0], message_id=_last_bak["id"])
+            _last_bak["id"] = mid
+    except Exception as e:
+        log.warning("backup: %s", e)
+
+def restore_from(path):
+    src = sqlite3.connect(path); src.execute("select count(*) from games")
+    with _lock: src.backup(db)
+    src.close(); init_db()
+
+def auto_restore():
+    if not OWNERS: return
+    if q1("select count(*) c from users")["c"] or q1("select count(*) c from products")["c"]: return
+    pm = tg("getChat", chat_id=OWNERS[0]).get("result", {}).get("pinned_message") or {}
+    fid = (pm.get("document") or {}).get("file_id")
+    if not fid: return
+    fp = tg("getFile", file_id=fid).get("result", {}).get("file_path")
+    if not fp: return
+    open("/tmp/restore.db", "wb").write(requests.get(f"https://api.telegram.org/file/bot{TOKEN}/{fp}", timeout=120).content)
+    restore_from("/tmp/restore.db"); _last_bak["id"] = pm.get("message_id")
+    log.info("Baza zaxiradan tiklandi")
+
+def backup_loop():
+    last = db.total_changes; lastt = 0
+    while True:
+        time.sleep(120)
+        if db.total_changes != last and time.time() - lastt > 240:
+            last = db.total_changes; lastt = time.time(); backup_now()
+
+async def cmd_backup(update, ctx):
+    if is_admin(update.effective_user.id):
+        await update.message.reply_text("⏳ Zaxira nusxa yuborilmoqda...")
+        await asyncio.to_thread(backup_now)
+
+async def on_doc(update, ctx):
+    u = update.effective_user; m = update.message
+    if not u or not is_admin(u.id) or not m.document or "/restore" not in (m.caption or ""): return
+    f = await m.document.get_file(); await f.download_to_drive("/tmp/restore.db")
+    try:
+        restore_from("/tmp/restore.db"); await m.reply_text("✅ Baza tiklandi")
+    except Exception as e:
+        await m.reply_text(f"❌ Xato: {e}")
+
 # ============================ BOT: USER SIDE ============================
 def webapp_url():
     return BASE_URL + "/"
@@ -317,6 +610,8 @@ async def send_welcome(update: Update, ctx):
     if r2: rows.append(r2)
     kb = InlineKeyboardMarkup(rows)
     img = gs("welcome_img")
+    if re.fullmatch(r"f\d+", img or ""):
+        _r = q1("select data from files where id=?", (int(img[1:]),)); img = _r["data"] if _r else None
     if img:
         try:
             return await ctx.bot.send_photo(u.id, img, caption=text, reply_markup=kb, parse_mode="HTML")
@@ -521,7 +816,10 @@ async def ask(update, ctx, st, text):
 async def cmd_admin(update, ctx):
     if not is_admin(update.effective_user.id): return
     ctx.user_data.pop("st", None)
-    await show(update, v_home())
+    rows = [[InlineKeyboardButton("🛠 Admin panelni ochish", web_app=WebAppInfo(url=webapp_url() + "?admin=1"))],
+            [InlineKeyboardButton("💬 Chat ichidagi panel", callback_data="a:home")]]
+    await update.message.reply_text("🛠 <b>SYREXA Admin</b>\nRasm, narx, karta — hammasini qulay panelda o'zgartiring:",
+                                    reply_markup=InlineKeyboardMarkup(rows), parse_mode="HTML")
 
 async def cmd_cancel(update, ctx):
     ctx.user_data.pop("st", None)
@@ -790,12 +1088,17 @@ def keepalive():
 def main():
     if not TOKEN: raise SystemExit("BOT_TOKEN kiritilmagan!")
     init_db()
+    try: auto_restore()
+    except Exception as e: log.warning("auto_restore: %s", e)
+    threading.Thread(target=backup_loop, daemon=True).start()
     threading.Thread(target=lambda: web.run(host="0.0.0.0", port=PORT, use_reloader=False, threaded=True), daemon=True).start()
     if BASE_URL: threading.Thread(target=keepalive, daemon=True).start()
     app = Application.builder().token(TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, on_doc))
     app.add_handler(CallbackQueryHandler(cb_chk, pattern="^chk$"))
     app.add_handler(CallbackQueryHandler(adm_cb, pattern="^a:"))
     app.add_handler(CallbackQueryHandler(cb_decide, pattern="^[to]:"))
@@ -856,7 +1159,13 @@ input{width:100%;padding:14px;border-radius:14px;border:1.5px solid var(--bd);ba
 .sh{width:100%;max-width:520px;background:#12152b;color:#f1f2fb;border-radius:24px 24px 0 0;padding:22px 16px 26px;text-align:center;--card:#1a1e3a;--bd:#2a2f52;--tx:#f1f2fb;--mut:#8b90ab}
 .sh .ic{font-size:34px;width:64px;height:64px;border-radius:18px;background:rgba(225,29,72,.15);margin:0 auto 10px;display:flex;align-items:center;justify-content:center}
 .tbl{background:#1a1e3a;border:1px solid #2a2f52;border-radius:14px;margin:14px 0;text-align:left}.tbl div{display:flex;justify-content:space-between;padding:12px 14px;border-bottom:1px solid #2a2f52;font-size:13px}.tbl div:last-child{border:0}.tbl .er{color:#fb7185}
-</style></head><body><div id="toast"></div><div id="app"></div>
+.tl{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0}.tile{position:relative;background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:16px 12px;font-weight:700;font-size:13px;cursor:pointer}.tile i{display:block;font-style:normal;font-size:26px;margin-bottom:6px}.bd{position:absolute;top:8px;right:8px;background:var(--er);color:#fff;border-radius:10px;font-size:11px;padding:1px 7px}
+.fm{width:calc(100% - 24px);max-width:480px;max-height:88vh;overflow:auto;background:var(--card);color:var(--tx);border-radius:20px;padding:16px}.fl{font-size:12px;color:var(--mut);margin:12px 0 5px;font-weight:600}
+textarea,select{width:100%;padding:12px;border-radius:14px;border:1.5px solid var(--bd);background:var(--card);color:var(--tx);font-size:15px;font-family:inherit}textarea{min-height:90px}
+.ip{display:flex;align-items:center;gap:12px}.ip img,.ip span{width:84px;height:62px;border-radius:12px;object-fit:cover;background:var(--bg);display:flex;align-items:center;justify-content:center;font-size:24px;flex:none}
+.li{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:10px;margin-bottom:8px;cursor:pointer}.li img,.li .pi{width:44px;height:44px;border-radius:10px;object-fit:cover;flex:none}.li .sp{min-width:0}
+.hero2 .ed{position:absolute;top:12px;right:12px;background:rgba(0,0,0,.55);border-radius:10px;padding:6px 10px;font-size:13px;color:#fff}
+</style></head><body><div id="toast"></div><div id="app"></div><div id="modal"></div>
 <script>
 const tg=window.Telegram.WebApp;tg.ready();tg.expand();
 const $=s=>document.querySelector(s);
@@ -883,12 +1192,12 @@ function gimg(g,cls){return g.img?`<img src="/img/${g.img}" loading="lazy">`:`<d
 function gcard(g){return `<div class="gc" onclick="openGame(${g.id})"><div class="gi">${gimg(g)}</div>${esc(g.name)}</div>`}
 function go(tab,arg){S.tab=tab;S.arg=arg;clearInterval(S.tm);if(tab!='game')S.g=null;S.sheet=false;document.body.style.background=tab=='game'?'#0a0c18':'';
  const back=(tab=='game'||tab=='pay');back?tg.BackButton.show():tg.BackButton.hide();render();window.scrollTo(0,0)}
-tg.BackButton.onClick(()=>go(S.tab=='pay'?'topup':'games'));
-function head(){const u=S.d.user;return `<div class="row" style="margin-bottom:12px"><div class="av">${esc((u.name||'?')[0])}</div><div><div class="mut sm">${t('hi')} 👋</div><b>${esc(u.name)}</b></div><div class="sp"></div><div class="ib" onclick="setLang()">${S.lang.toUpperCase()}</div><div class="ib" onclick="setDark()">${S.dark?'☀️':'🌙'}</div></div>`}
+tg.BackButton.onClick(()=>back());
+function head(){const u=S.d.user;return `<div class="row" style="margin-bottom:12px"><div class="av">${esc((u.name||'?')[0])}</div><div><div class="mut sm">${t('hi')} 👋</div><b>${esc(u.name)}</b></div><div class="sp"></div>${S.d.user.admin?`<div class="ib" onclick="admGo('adm')">🛠</div>`:''}<div class="ib" onclick="setLang()">${S.lang.toUpperCase()}</div><div class="ib" onclick="setDark()">${S.dark?'☀️':'🌙'}</div></div>`}
 function balCard(){return `<div class="card bal"><div style="font-size:26px">💳</div><div class="sp"><div class="mut sm">${t('bal')}</div><b>${money(S.d.user.balance)}</b> <span class="mut sm">so'm</span></div><button class="btn sm" onclick="go('topup')">+ ${t('top')}</button></div>`}
 function nav(){const a=[['home','🏠',t('home')],['games','🎮',t('games')],['topup','👛',t('top')],['orders','🕘',t('orders')],['prof','👤',t('prof')]];
  return `<div class="nav">${a.map(x=>`<div class="${S.tab==x[0]?'on':''}" onclick="go('${x[0]}')"><i>${x[1]}</i>${x[2]}</div>`).join('')}</div>`}
-function render(){const A=$('#app');const d=S.d;if(!d)return;
+function render(){const A=$('#app');const d=S.d;if(!d)return;if(S.tab.startsWith('adm')){A.innerHTML=vAdm();return}
  if(d.sub&&d.sub.length){A.innerHTML=`<div class="card" style="margin-top:40px;text-align:center"><div style="font-size:42px">📢</div><p>${t('sub')}</p>${d.sub.map(c=>`<button class="btn o" style="margin-bottom:8px" onclick="tg.openTelegramLink('${esc(c.link)}')">${esc(c.title)}</button>`).join('')}<button class="btn" onclick="boot()">${t('chk')}</button></div>`;return}
  let h='';const m=S.tab;
  if(m=='home')h=vHome();else if(m=='games')h=vGames();else if(m=='game')h=vGame();else if(m=='topup')h=vTopup();else if(m=='pay')h=vPay();else if(m=='orders')h=vOrders();else h=vProf();
@@ -938,12 +1247,81 @@ function ts(x){const d=new Date((x+18000)*1000);const p=n=>String(n).padStart(2,
 async function loadH(){if(S.hl)return;S.hl=1;try{S.h=await api('/api/history');const u=await api('/api/init');S.d.user=u.user;S.hl=0;if(S.tab=='orders')render()}catch(e){S.hl=0}}
 function vProf(){const u=S.d.user;return `<div class="card" style="text-align:center"><div class="av" style="margin:auto;width:70px;height:70px;font-size:30px">${esc((u.name||'?')[0])}</div><h3 style="margin:10px 0 2px">${esc(u.name)}</h3><div class="mut sm">${u.username?'@'+esc(u.username)+' · ':''}ID: ${u.id}</div></div>`+balCard()+
  `<div class="card"><b>🎟 ${t('promo')}</b><input id="pc" placeholder="${t('pr_in')}" style="margin:10px 0;text-transform:uppercase"><button class="btn" onclick="actPromo()">${t('act')}</button></div>
- <div class="card"><b>🌐 ${t('lang')}</b><div class="seg" style="margin:10px 0 0"><div class="${S.lang=='uz'?'on':''}" onclick="setLang('uz')">O'zbekcha</div><div class="${S.lang=='ru'?'on':''}" onclick="setLang('ru')">Русский</div></div></div>${u.admin?`<div class="card sm mut">🛠 ${t('adm')}</div>`:''}`}
+ <div class="card"><b>🌐 ${t('lang')}</b><div class="seg" style="margin:10px 0 0"><div class="${S.lang=='uz'?'on':''}" onclick="setLang('uz')">O'zbekcha</div><div class="${S.lang=='ru'?'on':''}" onclick="setLang('ru')">Русский</div></div></div>${u.admin?`<button class="btn" onclick="admGo('adm')">🛠 Admin panel</button>`:''}`}
 async function actPromo(){const c=$('#pc').value.trim();if(!c)return;try{const r=await api('/api/promo',{code:c});S.d.user.balance=r.balance;toast('✅ +'+money(r.amount));render()}catch(e){toast(t('bad'))}}
 function setLang(l){S.lang=l||(S.lang=='uz'?'ru':'uz');localStorage.lang=S.lang;S.d.user.lang=S.lang;api('/api/lang',{lang:S.lang}).catch(()=>{});render()}
 function setDark(){S.dark=!S.dark;localStorage.dark=S.dark?'1':'0';document.body.classList.toggle('dk',S.dark);render()}
-async function boot(){try{S.d=await api('/api/init');if(!localStorage.lang)S.lang=S.d.user.lang||'uz';document.body.classList.toggle('dk',S.dark||(!localStorage.dark&&tg.colorScheme=='dark'));render()}
+async function boot(){try{S.d=await api('/api/init');if(!localStorage.lang)S.lang=S.d.user.lang||'uz';document.body.classList.toggle('dk',S.dark||(!localStorage.dark&&tg.colorScheme=='dark'));if(new URLSearchParams(location.search).get('admin')&&S.d.user.admin)admGo('adm');else render()}
  catch(e){$('#app').innerHTML=`<div class="empty" style="margin-top:80px">${e.err=='maintenance'?'🛠 '+t('maint'):e.err=='banned'?'🚫':'Telegram ichida oching'}</div>`}}
+/* ===== ADMIN PANEL ===== */
+let F=null;
+const aj=(p,b)=>api('/api/a/'+p,b||{});
+function back(){const m=S.tab;if(m.startsWith('adm')){if(m=='adm')go('prof');else if(m=='adm_game')admGo('adm_games');else admGo('adm')}else go(m=='pay'?'topup':'games')}
+async function admGo(tab,arg){S.tab=tab;S.arg=arg;S.a=null;tg.BackButton.show();clearInterval(S.tm);document.body.style.background='';render();window.scrollTo(0,0);
+ try{S.a=await api('/api/a/data/'+(tab.slice(4)||'home')+'?id='+(arg||'')+'&q='+encodeURIComponent(S.aq||''))}catch(e){toast((e&&e.err)||t('err'))}
+ if(S.tab==tab)render()}
+const ah=(h,b)=>`<div class="hd"><h3>${h}</h3>${b||''}</div>`;
+const GF=[['name','Nomi','text'],['cat','Bo\'lim','sel',[['game','O\'yinlar'],['promo','Promokodlar bo\'limi']]],['img','Kichik ikonka (ro\'yxatdagi rasm)','img'],['hero','Katta banner (o\'yin sahifasi tepasi)','img'],['picon','Mahsulotlar uchun umumiy ikonka (UC, Diamonds rasmi)','img'],['field','Foydalanuvchi kiritadigan maydon (Player ID)','text'],['info','Info qator: matn | havola (ixtiyoriy)','text'],['active','Ko\'rinsinmi','tog']];
+const PF=[['name','Nomi (masalan 60 UC)','text'],['price','Narxi (so\'m)','number'],['grp','Guruh / tab (UC, Prime, Diamonds, RU...)','text'],['badge','Belgi (2x, HIT...)','text'],['img','Rasm (bo\'sh bo\'lsa umumiy ikonka)','img'],['active','Ko\'rinsinmi','tog']];
+const CF=[['number','Karta raqami','text'],['holder','Karta egasi ismi','text'],['bank','Bank (UZCARD, HUMO)','text'],['active','Faol','tog']];
+const BF=[['img','Banner rasmi','img'],['link','Bosilganda ochiladigan havola (ixtiyoriy)','text']];
+const SF=[['bot_name','Bot nomi','text'],['welcome_uz','Salomlashuv matni (UZ) — {name} = ism','area'],['welcome_ru','Salomlashuv matni (RU)','area'],['welcome_img','Salomlashuv rasmi','img'],['support_link','Yordam havolasi (https://t.me/...)','text'],['channel_link','Kanal havolasi','text'],['min_topup','Minimal to\'ldirish (so\'m)','number'],['card_ttl','Karta amal qilish vaqti (daqiqa)','number'],['maintenance','Texnik ishlar rejimi','tog']];
+function vAdm(){const a=S.a;if(!a)return '<div class="empty">⏳</div>';
+ return ({adm:aHome,adm_games:aGames,adm_game:aGame,adm_banners:aBanners,adm_cards:aCards,adm_users:aUsers,adm_tops:aTops,adm_ords:aOrds,adm_promos:aPromos,adm_chs:aChs,adm_set:aSet,adm_adms:aAdms,adm_bc:aBc}[S.tab]||aHome)(a)}
+function aHome(a){const c=(i,v,l)=>`<div class="card" style="margin:0"><div style="font-size:20px">${i}</div><b style="font-size:18px">${v}</b><div class="mut sm">${l}</div></div>`;
+ const M=[['games','🎮','O\'yinlar va narxlar'],['banners','🖼','Bannerlar'],['tops','💰','To\'ldirishlar',a.p_top],['ords','📦','Buyurtmalar',a.p_ord],['users','👥','Foydalanuvchilar'],['cards','💳','Kartalar'],['promos','🎟','Promokodlar'],['chs','📢','Majburiy obuna'],['bc','📨','Xabar yuborish'],['set','⚙️','Sozlamalar'],['adms','👮','Adminlar']];
+ return ah('🛠 Admin panel')+`<div class="tl">${c('👥',a.users,'Foydalanuvchi · bugun +'+a.new)}${c('💼',money(a.bal),'Umumiy balans')}${c('💰',money(a.top_sum),'To\'ldirilgan · bugun '+money(a.top_today))}${c('📦',a.ord_cnt,'Bajarilgan · '+money(a.ord_sum))}</div><div class="tl">${M.map(x=>`<div class="tile" onclick="S.aq='';admGo('adm_${x[0]}')"><i>${x[1]}</i>${x[2]}${x[3]?`<b class="bd">${x[3]}</b>`:''}</div>`).join('')}</div>`}
+function aGames(a){return ah('🎮 O\'yinlar',`<button class="btn sm" onclick="newGame()">+ O'yin</button>`)+`<div class="mut sm" style="margin-bottom:12px">O'yinni bosing → rasm, nom va narxlarni o'zgartiring</div><div class="grid">${a.games.map(g=>`<div class="gc" onclick="admGo('adm_game',${g.id})"><div class="gi">${gimg(g)}</div>${esc(g.name)}<div class="mut" style="font-size:10px">${g.pc} ta${g.active?'':' · 🔴'}</div></div>`).join('')}</div>`}
+function aGame(a){const g=a.game;if(!g)return '<div class="empty">—</div>';const hi=g.hero||g.img;
+ return ah(esc(g.name),`<button class="btn sm" onclick="editGame()">✏️ Tahrirlash</button>`)+`<div class="hero2" style="border-radius:18px;margin-bottom:12px;${hi?`background-image:url(/img/${hi})`:''}" onclick="editGame()"><div class="hs"></div><h2>${esc(g.name)}</h2><span class="ed">🖼 Rasmni o'zgartirish</span></div>
+ <div class="hd"><b>Mahsulotlar (${a.products.length})</b><span><button class="btn sm" onclick="newProd()">+ Mahsulot</button> <button class="btn o sm" onclick="bulkProd()">📥</button></span></div>`+
+ (a.products.map(p=>`<div class="li" onclick="editProd(${p.id})">${(p.img||g.picon)?`<img src="/img/${p.img||g.picon}">`:`<div class="pi">${esc(g.name[0])}</div>`}<div class="sp"><b>${esc(p.name)}</b>${p.badge?` <span class="tag pending">${esc(p.badge)}</span>`:''}<div class="mut sm">${esc(p.grp||'—')}${p.active?'':' · 🔴 yashirin'}</div></div><b>${money(p.price)}</b></div>`).join('')||'<div class="empty">Mahsulot yo\'q. «+ Mahsulot» yoki 📥 ni bosing</div>')}
+function editGame(){const g=S.a.game;openForm('O\'yin',GF,g,async v=>{await aj('save/games',Object.assign({},v,{id:g.id}));await admGo('adm_game',g.id)},{del:()=>delRow('games',g.id,()=>admGo('adm_games'))})}
+function newGame(){openForm('Yangi o\'yin',GF,{cat:'game',field:'Player ID',active:1},async v=>{const r=await aj('save/games',v);await admGo('adm_game',r.id)})}
+function newProd(){const g=S.a.game;openForm('Yangi mahsulot',PF,{active:1},async v=>{await aj('save/products',Object.assign({},v,{game_id:g.id}));await admGo('adm_game',g.id)})}
+function editProd(id){const g=S.a.game,p=S.a.products.find(x=>x.id==id);openForm('Mahsulot',PF,p,async v=>{await aj('save/products',Object.assign({},v,{id:id,game_id:g.id}));await admGo('adm_game',g.id)},{del:()=>delRow('products',id,()=>admGo('adm_game',g.id))})}
+function bulkProd(){const g=S.a.game;openForm('Ommaviy qo\'shish',[['text','Har qatorda: nom | narx | guruh | belgi','area']],{text:'60 UC | 11700 | UC\n325 UC | 59000 | UC'},async v=>{await aj('bulk',{game_id:g.id,text:v.text});await admGo('adm_game',g.id)})}
+function delRow(tb,id,after){ask('O\'chirasizmi?',async()=>{try{await aj('del/'+tb,{id:id});closeForm();after()}catch(e){toast((e&&e.err)||t('err'))}})}
+function aBanners(a){return ah('🖼 Bannerlar',`<button class="btn sm" onclick="editBan()">+ Banner</button>`)+(a.items.map(b=>`<div class="card" onclick="editBan(${b.id})" style="padding:8px"><div class="ban" style="margin:0"><div><img src="/img/${b.img}"></div></div><div class="mut sm" style="margin:6px 4px 0">${esc(b.link||'havolasiz')}</div></div>`).join('')||'<div class="empty">Banner yo\'q</div>')}
+function editBan(id){const b=id?S.a.items.find(x=>x.id==id):{};openForm('Banner',BF,b,async v=>{await aj('save/banners',Object.assign({},v,id?{id:id}:{}));await admGo('adm_banners')},id?{del:()=>delRow('banners',id,()=>admGo('adm_banners'))}:{})}
+function aCards(a){return ah('💳 Kartalar',`<button class="btn sm" onclick="editCard()">+ Karta</button>`)+'<div class="mut sm" style="margin-bottom:10px">Faol kartalardan biri to\'ldirishda tasodifiy beriladi</div>'+(a.items.map(c=>`<div class="li" onclick="editCard(${c.id})"><div class="sp"><b>${esc(c.number)}</b><div class="mut sm">${esc(c.holder)} · ${esc(c.bank)}</div></div>${c.active?'🟢':'🔴'}</div>`).join('')||'<div class="empty">Karta yo\'q! To\'ldirish ishlamaydi</div>')}
+function editCard(id){const c=id?S.a.items.find(x=>x.id==id):{active:1,bank:'UZCARD'};openForm('Karta',CF,c,async v=>{await aj('save/cards',Object.assign({},v,id?{id:id}:{}));await admGo('adm_cards')},id?{del:()=>delRow('cards',id,()=>admGo('adm_cards'))}:{})}
+function aUsers(a){return ah('👥 Foydalanuvchilar')+`<div class="row" style="margin-bottom:12px"><input id="uq" placeholder="ID, ism yoki @username" value="${esc(S.aq||'')}" onkeydown="if(event.key=='Enter')uSearch()"><button class="btn sm" onclick="uSearch()">🔍</button></div>`+a.items.map(u=>`<div class="li" onclick="editUser(${u.id})"><div class="av" style="width:38px;height:38px;font-size:15px">${esc((u.name||'?')[0])}</div><div class="sp"><b>${esc(u.name)}</b>${u.banned?' 🚫':''}<div class="mut sm">${u.username?'@'+esc(u.username)+' · ':''}${u.id}</div></div><b>${money(u.balance)}</b></div>`).join('')}
+function uSearch(){S.aq=$('#uq').value.trim();admGo('adm_users')}
+function editUser(id){const u=S.a.items.find(x=>x.id==id);openForm(u.name+' · '+money(u.balance)+' so\'m',[['amt','Summa (so\'m)','number'],['op','Amal','sel',[['add','➕ Balansga qo\'shish'],['sub','➖ Balansdan ayirish']]],['banned','Bloklangan','tog']],{op:'add',banned:u.banned},async v=>{await aj('user',{id:id,op:v.op,amt:v.amt,banned:v.banned});await admGo('adm_users')})}
+function decide(kind,id,ok){ask(ok?'Tasdiqlaysizmi?':'Rad etasizmi?',async()=>{try{const r=await aj(kind,{id:id,ok:ok});toast(r.msg);admGo(S.tab)}catch(e){toast(t('err'))}})}
+const dbtn=(k,id)=>`<div class="row" style="margin-top:10px"><button class="btn g sm" style="flex:1" onclick="decide('${k}',${id},1)">✅ Tasdiqlash</button><button class="btn o sm" style="flex:1" onclick="decide('${k}',${id},0)">❌ Rad / Bekor</button></div>`;
+function aTops(a){return ah('💰 To\'ldirishlar')+(a.items.map(x=>`<div class="card"><div class="row"><div class="sp"><b>+${money(x.amount)} so'm</b><div class="mut sm">${esc(x.uname||x.uid)} · #${x.id} · ${ts(x.created)}</div></div><span class="tag ${x.status}">${t(x.status)}</span></div>${x.status=='pending'?dbtn('topup',x.id):''}</div>`).join('')||'<div class="empty">Yo\'q</div>')}
+function aOrds(a){return ah('📦 Buyurtmalar')+(a.items.map(x=>`<div class="card"><div class="row"><div class="sp"><b>${esc(x.game)} — ${esc(x.product)}</b><div class="mut sm">ID: <b>${esc(x.player)}</b> · ${esc(x.uname||x.uid)}</div><div class="mut sm">#${x.id} · ${ts(x.created)} · ${money(x.price)} so'm</div></div><span class="tag ${x.status}">${t(x.status)}</span></div>${x.status=='pending'?dbtn('order',x.id):''}</div>`).join('')||'<div class="empty">Yo\'q</div>')}
+function aPromos(a){return ah('🎟 Promokodlar',`<button class="btn sm" onclick="editPromo()">+ Kod</button>`)+'<div class="mut sm" style="margin-bottom:10px">Kodni bossangiz — o\'chiriladi</div>'+(a.items.map(p=>`<div class="li" onclick="delRow('promos','${esc(p.code)}',()=>admGo('adm_promos'))"><div class="sp"><b>${esc(p.code)}</b><div class="mut sm">qolgan: ${p.left}</div></div><b>${money(p.amount)}</b><span>🗑</span></div>`).join('')||'<div class="empty">Yo\'q</div>')}
+function editPromo(){openForm('Promokod',[['code','Kod','text'],['amount','Summa (so\'m)','number'],['left','Necha kishi ishlata oladi','number']],{left:100},async v=>{await aj('save/promos',v);await admGo('adm_promos')})}
+function aChs(a){return ah('📢 Majburiy obuna',`<button class="btn sm" onclick="editCh()">+ Kanal</button>`)+'<div class="mut sm" style="margin-bottom:10px">Bot kanalda ADMIN bo\'lishi shart. Kanalni bossangiz — o\'chiriladi</div>'+(a.items.map(c=>`<div class="li" onclick="delRow('channels',${c.id},()=>admGo('adm_chs'))"><div class="sp"><b>${esc(c.title||c.chat_id)}</b><div class="mut sm">${esc(c.link)}</div></div><span>🗑</span></div>`).join('')||'<div class="empty">Yo\'q</div>')}
+function editCh(){openForm('Kanal qo\'shish',[['chat_id','Kanal @username yoki ID','text']],{},async v=>{await aj('save/channels',v);await admGo('adm_chs')})}
+function aSet(a){const s=a.s;return ah('⚙️ Sozlamalar',`<button class="btn sm" onclick="editSet()">✏️ Tahrirlash</button>`)+(s.welcome_img?`<div class="card" style="padding:8px"><img src="/img/${s.welcome_img}" style="width:100%;border-radius:12px"></div>`:'')+`<div class="card">${[['Bot nomi',s.bot_name],['Yordam',s.support_link],['Kanal',s.channel_link],['Minimal to\'ldirish',money(s.min_topup||0)],['Karta vaqti',s.card_ttl+' daqiqa'],['Texnik ishlar',s.maintenance=='1'?'YOQIQ':'o\'chiq']].map(x=>`<div class="row" style="padding:6px 0"><span class="mut sm sp">${x[0]}</span><b class="sm">${esc(x[1]||'—')}</b></div>`).join('')}</div>`}
+function editSet(){openForm('Sozlamalar',SF,S.a.s,async v=>{await aj('set',v);await admGo('adm_set')})}
+function aBc(a){return ah('📨 Xabar yuborish')+`<div class="card">Hozir <b>${a.users}</b> ta foydalanuvchiga xabar yuboriladi.<button class="btn" style="margin-top:12px" onclick="editBc()">✍️ Xabar yozish</button></div>`}
+function editBc(){openForm('Xabar',[['text','Xabar matni (HTML mumkin: <b>qalin</b>)','area'],['img','Rasm (ixtiyoriy)','img']],{},async v=>{if(!(v.text||v.img))throw{err:'Matn yoki rasm kerak'};await new Promise((ok,no)=>ask('Hammaga yuborilsinmi?',async()=>{try{await aj('broadcast',v);toast('✅ Yuborilmoqda...');ok()}catch(e){no(e)}}))})}
+function aAdms(a){return ah('👮 Adminlar',`<button class="btn sm" onclick="editAdm()">+ Admin</button>`)+a.items.map(i=>`<div class="li" ${a.owners.includes(i)?'':`onclick="delAdm(${i})"`}><div class="sp"><b>${i}</b><div class="mut sm">${a.owners.includes(i)?'Asosiy admin':'Bosing → olib tashlash'}</div></div></div>`).join('')}
+function editAdm(){openForm('Yangi admin',[['id','Telegram ID','number']],{},async v=>{await aj('admin',{id:v.id});await admGo('adm_adms')})}
+function delAdm(i){ask('Olib tashlansinmi?',async()=>{await aj('admin',{id:i,remove:1});admGo('adm_adms')})}
+/* --- forma oynasi --- */
+function openForm(title,fields,vals,save,extra){F={title:title,fields:fields,vals:Object.assign({},vals),save:save,extra:extra||{}};drawForm()}
+function Fs(k,v){F.vals[k]=v}
+function closeForm(){F=null;drawForm()}
+async function fSave(){try{await F.save(F.vals);closeForm()}catch(e){toast((e&&e.err)||t('err'))}}
+function fld(f){const k=f[0],l=f[1],ty=f[2],o=f[3],v=F.vals[k]==null?'':F.vals[k];let h=`<div class="fl">${esc(l)}</div>`;
+ if(ty=='area')h+=`<textarea oninput="Fs('${k}',this.value)">${esc(v)}</textarea>`;
+ else if(ty=='sel')h+=`<select onchange="Fs('${k}',this.value)">${o.map(x=>`<option value="${x[0]}" ${x[0]==v?'selected':''}>${esc(x[1])}</option>`).join('')}</select>`;
+ else if(ty=='tog')h+=`<div class="seg" style="margin:0"><div class="${+v?'on':''}" onclick="Fs('${k}',1);drawForm()">Ha</div><div class="${+v?'':'on'}" onclick="Fs('${k}',0);drawForm()">Yo'q</div></div>`;
+ else if(ty=='img')h+=`<div class="ip">${v?`<img src="/img/${esc(v)}">`:'<span>🖼</span>'}<div><label class="btn sm" style="display:inline-block">📷 Galereyadan<input type="file" accept="image/*" hidden onchange="upImg('${k}',this)"></label> ${v?`<button class="btn o sm" onclick="Fs('${k}','');drawForm()">✕</button>`:''}</div></div><div class="row" style="margin-top:8px"><input id="u_${k}" placeholder="yoki rasm havolasi https://..." style="padding:10px;font-size:13px"><button class="btn sm" onclick="impImg('${k}')">⬇️</button></div>`;
+ else h+=`<input ${ty=='number'?'inputmode="numeric"':''} value="${esc(v)}" oninput="Fs('${k}',this.value)">`;
+ return h}
+function drawForm(){const m=$('#modal');if(!F){m.innerHTML='';return}
+ m.innerHTML=`<div class="ov" style="align-items:center"><div class="fm"><div class="row"><b class="sp">${esc(F.title)}</b><div class="ib" onclick="closeForm()">✕</div></div>${F.fields.map(fld).join('')}<div class="row" style="margin-top:16px">${F.extra.del?`<button class="btn o" style="width:60px" onclick="F.extra.del()">🗑</button>`:''}<button class="btn" onclick="fSave()">💾 Saqlash</button></div></div></div>`}
+function shrink(file,max){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>{const im=new Image();im.onload=()=>{const k=Math.min(1,max/Math.max(im.width,im.height)),w=Math.round(im.width*k),h=Math.round(im.height*k),c=document.createElement('canvas');c.width=w;c.height=h;const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,w,h);x.drawImage(im,0,0,w,h);res(c.toDataURL('image/jpeg',.86))};im.onerror=rej;im.src=r.result};r.onerror=rej;r.readAsDataURL(file)})}
+async function upImg(k,inp){const f=inp.files[0];if(!f)return;toast('⏳ Yuklanmoqda...');try{const d=await shrink(f,1000);const r=await aj('upload',{data:d});Fs(k,r.ref);drawForm();toast('✅')}catch(e){toast((e&&e.err)||t('err'))}}
+async function impImg(k){const u=$('#u_'+k).value.trim();if(!u)return;toast('⏳ Yuklanmoqda...');try{const r=await aj('import',{url:u});Fs(k,r.ref);drawForm();toast('✅')}catch(e){toast((e&&e.err)||t('err'))}}
+
 boot();
 </script></body></html>"""
 
