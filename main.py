@@ -76,6 +76,11 @@ def q1(sql, args=()):
 def init_db():
     with _lock:
         db.executescript(SCHEMA); db.commit()
+    for sql in ("alter table games add column hero text default ''", "alter table games add column picon text default ''",
+                "alter table games add column info text default ''", "alter table products add column img text default ''",
+                "alter table products add column grp text default ''", "alter table products add column badge text default ''"):
+        try: ex(sql)
+        except Exception: pass
     if not q1("select 1 x from games"):
         for i, (n, c) in enumerate(SEED_GAMES):
             ex("insert into games(name,cat,sort) values(?,?,?)", (n, c, i))
@@ -206,9 +211,12 @@ def api_init(u):
 @web.route("/api/game/<int:gid>")
 @need_user
 def api_game(u, gid):
-    g = q1("select id,name,img,field,cat from games where id=? and active=1", (gid,))
+    g = q1("select id,name,img,hero,picon,info,field,cat from games where id=? and active=1", (gid,))
     if not g: return jsonify(err="nf"), 404
-    g["products"] = qa("select id,name,price from products where game_id=? and active=1 order by price,id", (gid,))
+    g["products"] = qa("select id,name,price,img,grp,badge from products where game_id=? and active=1 order by id", (gid,))
+    for p in g["products"]: p["img"] = p["img"] or g["picon"]
+    inf = g.get("info") or ""
+    g["info"] = {"text": inf.split("|")[0].strip(), "link": inf.split("|")[1].strip() if "|" in inf else ""} if inf else None
     return jsonify(g)
 
 @web.route("/api/order", methods=["POST"])
@@ -405,8 +413,10 @@ def v_game(gid):
            f"ID maydoni: <i>{E(g['field'])}</i>\nRasm: {'✅' if g['img'] else '❌'}\nHolat: {'faol' if g['active'] else 'o`chirilgan'}\n"
            f"Mahsulotlar: {len(ps)} ta")
     rows = [[("➕ Mahsulot qo'shish", f"a:padd:{gid}")]]
-    for p in ps: rows.append([(f"{'🟢' if p['active'] else '🔴'} {p['name']} — {money(p['price'])}", f"a:p:{p['id']}")])
-    rows += [[("✏️ Nom", f"a:gname:{gid}"), ("🖼 Rasm", f"a:gimg:{gid}")],
+    for p in ps: rows.append([(f"{'🟢' if p['active'] else '🔴'} {(p['grp']+' · ') if p['grp'] else ''}{p['name']} — {money(p['price'])}", f"a:p:{p['id']}")])
+    rows += [[("🖼 Banner (katta rasm)", f"a:ghero:{gid}"), ("💎 Mahsulot ikonkasi", f"a:gpicon:{gid}")],
+             [("🖼 Guruhga rasm", f"a:pgimg:{gid}"), ("ℹ️ Info qator", f"a:ginfo:{gid}")],
+             [("✏️ Nom", f"a:gname:{gid}"), ("🖼 Kichik ikonka", f"a:gimg:{gid}")],
              [("🔤 ID maydoni nomi", f"a:gfield:{gid}"), ("📂 Kategoriya", f"a:gcat2:{gid}")],
              [("👁 Yoqish/O'chirish", f"a:gtog:{gid}"), ("🗑 O'yinni o'chirish", f"a:gdel:{gid}")],
              [("🔙 O'yinlar", "a:games")]]
@@ -415,8 +425,9 @@ def v_game(gid):
 def v_prod(pid):
     p = q1("select * from products where id=?", (pid,))
     if not p: return "Topilmadi", [[("🔙", "a:games")]]
-    return (f"📦 <b>{E(p['name'])}</b>\n💰 {money(p['price'])} so'm\nHolat: {'faol' if p['active'] else 'o`chirilgan'}",
+    return (f"📦 <b>{E(p['name'])}</b>\n💰 {money(p['price'])} so'm\nGuruh: {E(p['grp'] or '-')} · Belgi: {E(p['badge'] or '-')} · Rasm: {'✅' if p['img'] else '❌'}\nHolat: {'faol' if p['active'] else 'o`chirilgan'}",
             [[("✏️ Nom", f"a:pname:{pid}"), ("💰 Narx", f"a:pprice:{pid}")],
+             [("🖼 Rasm", f"a:pimg:{pid}"), ("📂 Guruh", f"a:pgrp:{pid}"), ("🏷 Belgi", f"a:pbadge:{pid}")],
              [("👁 Yoqish/O'chirish", f"a:ptog:{pid}"), ("🗑 O'chirish", f"a:pdel:{pid}")],
              [("🔙 O'yin", f"a:g:{p['game_id']}")]])
 
@@ -544,6 +555,13 @@ async def adm_cb(update, ctx):
     if a == "gname": return await ask(update, ctx, ("gname", int(x)), "✏️ Yangi nomni yuboring:")
     if a == "gimg": return await ask(update, ctx, ("gimg", int(x)), "🖼 Rasmni yuboring (rasm sifatida):")
     if a == "gfield": return await ask(update, ctx, ("gfield", int(x)), "🔤 Foydalanuvchi to'ldiradigan maydon nomi (masalan: Player ID, UID, Telegram username):")
+    if a == "ghero": return await ask(update, ctx, ("ghero", int(x)), "🖼 O'yin sahifasi tepasidagi KATTA banner rasmini yuboring (gorizontal, rasm sifatida):")
+    if a == "gpicon": return await ask(update, ctx, ("gpicon", int(x)), "💎 Mahsulotlar uchun umumiy ikonka yuboring (masalan UC rasmi). Alohida rasmi yo'q mahsulotlar shuni ishlatadi:")
+    if a == "ginfo": return await ask(update, ctx, ("ginfo", int(x)), "ℹ️ Format: <code>matn | havola</code>\nMasalan: <code>MLBB News Channel | https://t.me/kanal</code>\nO'chirish: <code>-</code>")
+    if a == "pgimg": return await ask(update, ctx, ("pgname", int(x)), "📂 Qaysi guruhga rasm qo'yamiz? Guruh nomini yuboring (masalan: UC). Guruhsiz mahsulotlar uchun <code>-</code>")
+    if a == "pimg": return await ask(update, ctx, ("pimg", int(x)), "🖼 Mahsulot rasmini yuboring:")
+    if a == "pgrp": return await ask(update, ctx, ("pgrp", int(x)), "📂 Guruh (tab) nomi, masalan: UC, Prime, Diamonds, RU. Tozalash: <code>-</code>")
+    if a == "pbadge": return await ask(update, ctx, ("pbadge", int(x)), "🏷 Belgi matni, masalan: 2x, EP, HIT. Tozalash: <code>-</code>")
     if a == "gcat2":
         g = q1("select cat from games where id=?", (int(x),))
         ex("update games set cat=? where id=?", ("promo" if g["cat"] == "game" else "game", int(x)))
@@ -557,7 +575,7 @@ async def adm_cb(update, ctx):
         ex("delete from products where game_id=?", (int(x),)); ex("delete from games where id=?", (int(x),))
         return await S(v_games())
     if a == "padd": return await ask(update, ctx, ("padd", int(x)),
-        "➕ Mahsulot(lar)ni yuboring. Har qatorda: <code>nom | narx</code>\nMasalan:\n<code>60 UC | 12000\n325 UC | 60000</code>")
+        "➕ Mahsulot(lar)ni yuboring. Har qatorda: <code>nom | narx | guruh | belgi</code> (guruh va belgi ixtiyoriy)\nMasalan:\n<code>60 UC | 11700 | UC\n325 UC | 59000 | UC\nPrime | 12000 | Prime | HIT</code>")
     if a == "p": return await S(v_prod(int(x)))
     if a == "pname": return await ask(update, ctx, ("pname", int(x)), "✏️ Yangi mahsulot nomi:")
     if a == "pprice": return await ask(update, ctx, ("pprice", int(x)), "💰 Yangi narx (so'm):")
@@ -651,13 +669,27 @@ async def on_msg(update, ctx):
         if k == "gimg":
             if not photo: return await m.reply_text("Rasm yuboring (fayl emas, rasm sifatida)")
             ex("update games set img=? where id=?", (photo, st[1])); done(); return await show(update, v_game(st[1]))
+        if k in ("ghero", "gpicon", "pimg"):
+            if not photo: return await m.reply_text("Rasm yuboring (fayl emas, rasm sifatida)")
+            if k == "pimg":
+                ex("update products set img=? where id=?", (photo, st[1])); done(); return await show(update, v_prod(st[1]))
+            ex(f"update games set {'hero' if k=='ghero' else 'picon'}=? where id=?", (photo, st[1])); done(); return await show(update, v_game(st[1]))
+        if k == "ginfo":
+            ex("update games set info=? where id=?", ("" if txt == "-" else txt, st[1])); done(); return await show(update, v_game(st[1]))
+        if k in ("pgrp", "pbadge"):
+            ex(f"update products set {'grp' if k=='pgrp' else 'badge'}=? where id=?", ("" if txt == "-" else txt, st[1])); done(); return await show(update, v_prod(st[1]))
+        if k == "pgname":
+            return await ask(update, ctx, ("pgimg", st[1], "" if txt == "-" else txt), f"🖼 «{E(txt)}» guruhidagi barcha mahsulotlar uchun rasm yuboring:")
+        if k == "pgimg":
+            if not photo: return await m.reply_text("Rasm yuboring")
+            ex("update products set img=? where game_id=? and grp=?", (photo, st[1], st[2])); done(); return await show(update, v_game(st[1]))
         if k == "padd":
             n = 0
             for line in txt.splitlines():
-                if "|" in line:
-                    nm, pr = line.rsplit("|", 1)
-                    if nm.strip() and num(pr) > 0:
-                        ex("insert into products(game_id,name,price) values(?,?,?)", (st[1], nm.strip(), num(pr))); n += 1
+                pt = [x.strip() for x in line.split("|")]
+                if len(pt) >= 2 and pt[0] and num(pt[1]) > 0:
+                    ex("insert into products(game_id,name,price,grp,badge) values(?,?,?,?,?)",
+                       (st[1], pt[0], num(pt[1]), pt[2] if len(pt) > 2 else "", pt[3] if len(pt) > 3 else "")); n += 1
             if not n: return await m.reply_text("Format xato. <code>nom | narx</code>", parse_mode="HTML")
             done(); return await show(update, v_game(st[1]))
         if k == "pname":
@@ -811,6 +843,19 @@ input{width:100%;padding:14px;border-radius:14px;border:1.5px solid var(--bd);ba
 .tm{font-weight:800;color:var(--p)}.bar{height:5px;border-radius:5px;background:var(--bd);overflow:hidden;margin-top:8px}.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--p),var(--p2))}
 #toast{position:fixed;top:14px;left:50%;transform:translateX(-50%);background:#151a30;color:#fff;padding:11px 18px;border-radius:14px;font-size:14px;z-index:9;display:none;max-width:90%}
 .empty{text-align:center;padding:50px 10px;color:var(--mut)}
+.gv{--bg:#0a0c18;--card:#151932;--tx:#f1f2fb;--mut:#8b90ab;--bd:#242949;background:#0a0c18;color:var(--tx);margin:-14px -14px 0;padding-bottom:100px;min-height:100vh}
+.hero2{height:200px;background:linear-gradient(135deg,#1b1147,#6d3df0);background-size:cover;background-position:center;position:relative;display:flex;align-items:flex-end;padding:16px}
+.hero2 .hs{position:absolute;inset:0;background:linear-gradient(transparent 35%,#0a0c18)}.hero2 h2{position:relative;margin:0;font-size:24px;font-weight:800}
+.info{display:flex;justify-content:space-between;align-items:center;margin:12px 14px;padding:13px 14px;border-radius:14px;background:var(--card);border:1px solid var(--bd);font-weight:700;font-size:14px}
+.tabs{display:flex;gap:8px;flex-wrap:wrap;padding:4px 14px 0}.tabs span{padding:8px 14px;border-radius:20px;background:var(--card);border:1px solid var(--bd);font-size:12px;font-weight:700;cursor:pointer}
+.tabs .on{background:linear-gradient(135deg,var(--p),var(--p2));border-color:transparent;color:#fff}.gt{margin:16px 14px 10px;font-weight:700}
+.pg{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:0 14px}.pc{display:flex;align-items:center;gap:10px;padding:12px;border-radius:14px;background:var(--card);border:1px solid var(--bd);cursor:pointer;min-height:64px}
+.pc img,.pi{width:44px;height:44px;border-radius:10px;object-fit:cover;flex:none}.pi{background:linear-gradient(135deg,var(--p),var(--p2));display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff}
+.pt{display:flex;flex-direction:column;gap:3px;font-size:12px;min-width:0}.pt b{font-size:13px}.pt span{font-weight:800}.pt small{color:var(--mut);font-weight:400}.pt em{font-style:normal;background:#f59e0b;color:#fff;border-radius:6px;padding:1px 6px;font-size:10px}
+.ov{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:8;display:flex;align-items:flex-end;justify-content:center}
+.sh{width:100%;max-width:520px;background:#12152b;color:#f1f2fb;border-radius:24px 24px 0 0;padding:22px 16px 26px;text-align:center;--card:#1a1e3a;--bd:#2a2f52;--tx:#f1f2fb;--mut:#8b90ab}
+.sh .ic{font-size:34px;width:64px;height:64px;border-radius:18px;background:rgba(225,29,72,.15);margin:0 auto 10px;display:flex;align-items:center;justify-content:center}
+.tbl{background:#1a1e3a;border:1px solid #2a2f52;border-radius:14px;margin:14px 0;text-align:left}.tbl div{display:flex;justify-content:space-between;padding:12px 14px;border-bottom:1px solid #2a2f52;font-size:13px}.tbl div:last-child{border:0}.tbl .er{color:#fb7185}
 </style></head><body><div id="toast"></div><div id="app"></div>
 <script>
 const tg=window.Telegram.WebApp;tg.ready();tg.expand();
@@ -828,13 +873,15 @@ amount:'Введите сумму',min:'Минимум',steps:'Шаги попо
 exact:'Переведите ровно',one:'Только ОДИН перевод',onet:'Не разбивайте и не округляйте сумму.',valid:'Карта действует',card:'Номер карты',copy:'Копировать',copied:'Скопировано',paid:'Я оплатил',rules:'Правила оплаты',r1:'Не меняйте сумму даже на 1 сум',r2:'Оплатите в течение времени',r3:'Не отправляйте другую сумму',r4:'Не разбивайте сумму на два перевода',
 buy:'Купить',pid_:'Введите ID',pick:'Выберите товар',noprod:'Товары ещё не добавлены',noord:'Нет заказов',notx:'Нет транзакций',nobal:'Недостаточно средств',ok:'Успешно!',
 pending:'Ожидание',done:'Выполнен',canceled:'Отменён',approved:'Подтверждён',rejected:'Отклонён',new:'Новый',pr_in:'ПРОМОКОД',act:'Активировать',lang:'Язык',sub:'Подпишитесь на канал, чтобы пользоваться ботом',chk:'Проверить',nocard:'Способ оплаты пока недоступен',err:'Ошибка',bad:'Код не найден или использован',added:'Добавлено',expired:'Время истекло',maint:'Технические работы',confirm:'Подтвердить?',adm:'Для админ-панели напишите боту /admin',bonus:'Баланс пополнен'}};
+Object.assign(T.uz,{nobal2:'Bu xarid uchun balansda mablag\' yetarli emas. Avval balansni to\'ldiring.',price:'Mahsulot narxi',short:'Yetmaydi',close:'Yopish',topbal:'Balansni to\'ldirish'});
+Object.assign(T.ru,{nobal2:'На балансе недостаточно средств для этой покупки. Сначала пополните баланс.',price:'Цена товара',short:'Не хватает',close:'Закрыть',topbal:'Пополнение баланса'});
 const t=k=>(T[S.lang]||T.uz)[k]||k;
 function toast(m){const e=$('#toast');e.textContent=m;e.style.display='block';clearTimeout(S.tt);S.tt=setTimeout(()=>e.style.display='none',2600)}
 async function api(p,body){const r=await fetch(p,{method:body!==undefined?'POST':'GET',headers:{'Content-Type':'application/json','X-Init':tg.initData},body:body!==undefined?JSON.stringify(body):undefined});const j=await r.json().catch(()=>({}));if(!r.ok)throw j;return j}
 function ask(m,cb){tg.showConfirm?tg.showConfirm(m,ok=>ok&&cb()):(confirm(m)&&cb())}
 function gimg(g,cls){return g.img?`<img src="/img/${g.img}" loading="lazy">`:`<div class="ph">${esc(g.name[0])}</div>`}
 function gcard(g){return `<div class="gc" onclick="openGame(${g.id})"><div class="gi">${gimg(g)}</div>${esc(g.name)}</div>`}
-function go(tab,arg){S.tab=tab;S.arg=arg;clearInterval(S.tm);if(tab!='game')S.g=null;
+function go(tab,arg){S.tab=tab;S.arg=arg;clearInterval(S.tm);if(tab!='game')S.g=null;S.sheet=false;document.body.style.background=tab=='game'?'#0a0c18':'';
  const back=(tab=='game'||tab=='pay');back?tg.BackButton.show():tg.BackButton.hide();render();window.scrollTo(0,0)}
 tg.BackButton.onClick(()=>go(S.tab=='pay'?'topup':'games'));
 function head(){const u=S.d.user;return `<div class="row" style="margin-bottom:12px"><div class="av">${esc((u.name||'?')[0])}</div><div><div class="mut sm">${t('hi')} 👋</div><b>${esc(u.name)}</b></div><div class="sp"></div><div class="ib" onclick="setLang()">${S.lang.toUpperCase()}</div><div class="ib" onclick="setDark()">${S.dark?'☀️':'🌙'}</div></div>`}
@@ -845,7 +892,7 @@ function render(){const A=$('#app');const d=S.d;if(!d)return;
  if(d.sub&&d.sub.length){A.innerHTML=`<div class="card" style="margin-top:40px;text-align:center"><div style="font-size:42px">📢</div><p>${t('sub')}</p>${d.sub.map(c=>`<button class="btn o" style="margin-bottom:8px" onclick="tg.openTelegramLink('${esc(c.link)}')">${esc(c.title)}</button>`).join('')}<button class="btn" onclick="boot()">${t('chk')}</button></div>`;return}
  let h='';const m=S.tab;
  if(m=='home')h=vHome();else if(m=='games')h=vGames();else if(m=='game')h=vGame();else if(m=='topup')h=vTopup();else if(m=='pay')h=vPay();else if(m=='orders')h=vOrders();else h=vProf();
- A.innerHTML=h+((m=='game'||m=='pay')?'':nav());
+ A.innerHTML=h+((m=='game'||m=='pay')?'':nav())+((m=='game'&&S.sheet&&S.sel)?sheet():'');
  if(m=='pay')tick();}
 function vHome(){const d=S.d;
  const bn=d.banners.length?d.banners.map(b=>`<div onclick="${b.link?`tg.openLink('${esc(b.link)}')`:''}"><img src="/img/${b.img}"></div>`).join(''):`<div class="hero">${esc(d.cfg.bot)}</div>`;
@@ -855,14 +902,22 @@ function sup(){const l=S.d.cfg.support;l?tg.openTelegramLink(l):toast(t('sup'))}
 function vGames(){const L=S.d.games.filter(g=>g.cat==S.seg&&g.name.toLowerCase().includes(S.q.toLowerCase()));
  return `<h3>${t('games')}</h3><input id="sq" placeholder="🔍 ${t('search')}" value="${esc(S.q)}" oninput="S.q=this.value;gridUpd()" style="margin-bottom:12px"><div class="seg"><div class="${S.seg=='game'?'on':''}" onclick="S.seg='game';render()">${t('games')}</div><div class="${S.seg=='promo'?'on':''}" onclick="S.seg='promo';render()">${t('promo')}</div></div><div class="grid" id="gg">${L.map(gcard).join('')}</div>`}
 function gridUpd(){const L=S.d.games.filter(g=>g.cat==S.seg&&g.name.toLowerCase().includes(S.q.toLowerCase()));$('#gg').innerHTML=L.map(gcard).join('')}
-async function openGame(id){S.g=null;S.pid=null;S.player='';go('game',id);try{S.g=await api('/api/game/'+id);render()}catch(e){toast(t('err'));go('games')}}
-function vGame(){const g=S.g;if(!g)return `<div class="empty">⏳</div>`;const p=g.products.find(x=>x.id==S.pid);
- return `<div class="row" style="margin-bottom:14px"><div class="gi" style="width:64px;margin:0">${gimg(g)}</div><h3 style="margin:0">${esc(g.name)}</h3></div>
- <input id="pl" placeholder="${esc(g.field)}" value="${esc(S.player)}" oninput="S.player=this.value" style="margin-bottom:12px">
- ${g.products.length?g.products.map(x=>`<div class="prod ${x.id==S.pid?'on':''}" onclick="S.pid=${x.id};render()"><span>${esc(x.name)}</span><span>${money(x.price)} so'm</span></div>`).join(''):`<div class="empty">${t('noprod')}</div>`}
- <div style="position:fixed;left:14px;right:14px;bottom:14px;max-width:492px;margin:auto"><button class="btn" onclick="buy()" ${g.products.length?'':'disabled'}>${t('buy')}${p?' — '+money(p.price)+' so\'m':''}</button></div>`}
-async function buy(){const g=S.g,p=g.products.find(x=>x.id==S.pid);if(!p)return toast(t('pick'));if((S.player||'').trim().length<2)return toast(t('pid_'));
- ask(`${g.name} — ${p.name}\n${money(p.price)} so'm\n${g.field}: ${S.player}`,async()=>{try{const r=await api('/api/order',{product_id:p.id,player:S.player.trim()});S.d.user.balance=r.balance;toast('✅ '+t('ok'));S.oseg='o';go('orders')}catch(e){if(e.err=='balance'){toast(t('nobal'));go('topup')}else toast(t('err'))}})}
+async function openGame(id){S.g=null;S.sel=null;S.grp=null;go('game',id);try{S.g=await api('/api/game/'+id);render()}catch(e){toast(t('err'));go('games')}}
+function infoRow(i){return `<div class="info" onclick="${i.link?`tg.openLink('${esc(i.link)}')`:''}"><span>${esc(i.text)}</span><em style="font-style:normal">›</em></div>`}
+function vGame(){const g=S.g;if(!g)return `<div class="empty">⏳</div>`;
+ const grps=[...new Set(g.products.map(p=>p.grp||''))];if(S.grp==null||!grps.includes(S.grp))S.grp=grps[0]||'';
+ const L=g.products.filter(p=>(p.grp||'')==S.grp),hi=g.hero||g.img;
+ return `<div class="gv"><div class="hero2" style="${hi?`background-image:url(/img/${hi})`:''}"><div class="hs"></div><h2>${esc(g.name)}</h2></div>${g.info?infoRow(g.info):''}
+ ${(grps.length>1||grps[0])?`<div class="tabs">${grps.map(x=>`<span class="${x==S.grp?'on':''}" data-g="${esc(x)}" onclick="S.grp=this.dataset.g;render()">${esc(x)}</span>`).join('')}</div>`:''}
+ <div class="gt">${t('pick')}</div><div class="pg">${L.length?L.map(p=>`<div class="pc" onclick="selP(${p.id})">${p.img?`<img src="/img/${p.img}" loading="lazy">`:`<div class="pi">${esc(g.name[0])}</div>`}<div class="pt"><b>${esc(p.name)}${p.badge?` <em>${esc(p.badge)}</em>`:''}</b><span>${money(p.price)} <small>so'm</small></span></div></div>`).join(''):`<div class="empty" style="grid-column:1/3">${t('noprod')}</div>`}</div></div>`}
+function selP(id){S.sel=S.g.products.find(x=>x.id==id);S.sheet=true;render()}
+function closeSheet(){S.sheet=false;render()}
+function sheet(){const p=S.sel,bal=S.d.user.balance,sh=p.price-bal;
+ return `<div class="ov" onclick="closeSheet()"><div class="sh" onclick="event.stopPropagation()">`+(sh>0?
+ `<div class="ic">👛</div><h3 style="margin:0">${t('nobal')}</h3><p class="mut sm">${t('nobal2')}</p><div class="tbl"><div><span class="mut">${t('price')}</span><b>${money(p.price)} so'm</b></div><div><span class="mut">${t('bal')}</span><b>${money(bal)} so'm</b></div><div class="er"><span>${t('short')}</span><b>${money(sh)} so'm</b></div></div><div class="row"><button class="btn o" onclick="closeSheet()">${t('close')}</button><button class="btn" onclick="S.sheet=false;go('topup')">+ ${t('topbal')}</button></div>`
+ :`<h3 style="margin:0 0 4px">${esc(S.g.name)}</h3><div class="mut sm">${esc(p.name)}</div><input id="pl" placeholder="${esc(S.g.field)}" value="${esc(S.player)}" oninput="S.player=this.value" style="margin:14px 0 0"><div class="tbl"><div><span class="mut">${t('price')}</span><b>${money(p.price)} so'm</b></div><div><span class="mut">${t('bal')}</span><b>${money(bal)} so'm</b></div></div><div class="row"><button class="btn o" onclick="closeSheet()">${t('close')}</button><button class="btn" onclick="buy()">${t('buy')}</button></div>`)+`</div></div>`}
+async function buy(){const g=S.g,p=S.sel;if(!p)return;if((S.player||'').trim().length<2)return toast(t('pid_'));
+ ask(`${g.name} — ${p.name}\n${money(p.price)} so'm\n${g.field}: ${S.player}`,async()=>{try{const r=await api('/api/order',{product_id:p.id,player:S.player.trim()});S.d.user.balance=r.balance;S.sheet=false;toast('✅ '+t('ok'));S.oseg='o';go('orders')}catch(e){if(e.err=='balance'){toast(t('nobal'));render()}else toast(t('err'))}})}
 function vTopup(){const A=[10000,50000,100000,200000,500000];
  return `<h3>${t('top')}</h3>`+balCard().replace(/<button.*<\/button>/,'')+`<div class="card"><div class="mut sm">${t('amount')}</div><input id="am" inputmode="numeric" value="${money(S.amt)}" oninput="S.amt=+this.value.replace(/\\D/g,'')||0"><div class="chips">${[50000,100000,200000,500000].map(a=>`<div class="${S.amt==a?'on':''}" onclick="S.amt=${a};render()">${a/1000}k</div>`).join('')}</div><div class="mut sm">${t('min')}: ${money(S.d.cfg.min)}</div></div>
  <div class="card"><b>${t('steps')}</b>${[1,2,3,4].map(i=>`<div class="row" style="margin-top:10px"><div class="ib" style="width:26px;height:26px;border-radius:50%;font-size:12px">${i}</div><div class="sm">${t('s'+i)}</div></div>`).join('')}</div><button class="btn" onclick="mkTop()">${t('top')}</button>`}
